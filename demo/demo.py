@@ -4,10 +4,6 @@ import glob
 import multiprocessing as mp
 import numpy as np
 import os
-import re
-import shutil
-import subprocess
-import threading
 import sys
 import tempfile
 import time
@@ -27,7 +23,8 @@ from projects.YOSO.yoso.segmentator import YOSO
 WINDOW_NAME = "COCO detections"
 
 
-def _update_fps_ema(prev_ema, dt_sec, alpha=0.15):
+def _update_fps_ema(prev_ema, dt_sec, alpha=0.2):
+    """EWMA of FPS where dt_sec is seconds per frame (e.g. model inference time); inst = 1/dt_sec."""
     if dt_sec <= 0:
         return prev_ema
     inst = 1.0 / dt_sec
@@ -36,11 +33,11 @@ def _update_fps_ema(prev_ema, dt_sec, alpha=0.15):
     return (1.0 - alpha) * prev_ema + alpha * inst
 
 
-def _draw_fps_overlay(bgr_frame, fps):
+def _draw_fps_overlay(bgr_frame, fps, label="Infer FPS"):
     """Draw FPS in the top-left corner (BGR image, modified in place)."""
     cv2.putText(
         bgr_frame,
-        "FPS: {:.1f}".format(fps),
+        "{}: {:.1f}".format(label, fps),
         (10, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.9,
@@ -88,25 +85,7 @@ def get_parser():
         "--camera-device",
         default=None,
         metavar="PATH",
-        help="V4L2 device path (e.g. /dev/video4). Prefer this in Docker or when --camera-index fails; "
-        "usually pairs with: docker --device /dev/video4:/dev/video4",
-    )
-    parser.add_argument(
-        "--webcam-use-ffmpeg",
-        action="store_true",
-        help="Capture via ffmpeg v4l2 instead of OpenCV (recommended in Docker if OpenCV cannot open the device).",
-    )
-    parser.add_argument(
-        "--webcam-size",
-        default="640x480",
-        metavar="WxH",
-        help="Resolution for ffmpeg capture (e.g. 640x480 or 1280x720). Tried first, then other common sizes.",
-    )
-    parser.add_argument(
-        "--webcam-fps",
-        type=int,
-        default=30,
-        help="Framerate for ffmpeg webcam capture.",
+        help="Optional V4L2 device path (e.g. /dev/video0). If not set, uses --camera-index with cv2.VideoCapture.",
     )
     parser.add_argument("--video-input", help="Path to video file.")
     parser.add_argument(
@@ -125,7 +104,20 @@ def get_parser():
         action="store_true",
         help="Do not draw FPS on webcam / video preview windows.",
     )
-
+    parser.add_argument(
+        "--input-width",
+        type=int,
+        default=512,
+        metavar="W",
+        help="Resize width for webcam / video frames before inference (default 512).",
+    )
+    parser.add_argument(
+        "--input-height",
+        type=int,
+        default=256,
+        metavar="H",
+        help="Resize height for webcam / video frames before inference (default 256).",
+    )
     parser.add_argument(
         "--overlap-threshold",
         type=float,
@@ -164,221 +156,35 @@ def test_opencv_video_format(codec, file_ext):
         return False
 
 
-def _try_open_capture(src, backend, logger, label):
-    """Try VideoCapture; optionally verify we can read at least one frame."""
-    cap = cv2.VideoCapture(src, backend) if backend is not None else cv2.VideoCapture(src)
+def open_webcam_cv2(camera_device, camera_index, logger):
+    """Open webcam using only cv2.VideoCapture (optionally CAP_V4L2 on Linux for /dev/video*)."""
+    if camera_device:
+        path = os.path.expanduser(camera_device)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                "Camera device not found: {!r}. Check the path and Docker --device.".format(path)
+            )
+        if sys.platform.startswith("linux") and hasattr(cv2, "CAP_V4L2"):
+            cap = cv2.VideoCapture(path, cv2.CAP_V4L2)
+        else:
+            cap = cv2.VideoCapture(path)
+    else:
+        cap = cv2.VideoCapture(camera_index)
+
     if not cap.isOpened():
         cap.release()
-        return None
-    ok, frame = False, None
-    for _ in range(20):
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            return cap
-        time.sleep(0.05)
-    logger.warning("%s: opened but no frames read from %r; trying next.", label, src)
-    cap.release()
-    return None
-
-
-def _parse_webcam_size(s):
-    s = s.strip().lower().replace("*", "x")
-    if "x" not in s:
-        raise ValueError("--webcam-size must be like 640x480")
-    a, b = s.split("x", 1)
-    return int(a), int(b)
-
-
-def _webcam_size_tries(first_wh):
-    """User preference first, then common modes."""
-    rest = [(640, 480), (1280, 720), (320, 240), (800, 600), (640, 360), (1920, 1080)]
-    out = [first_wh]
-    for r in rest:
-        if r not in out:
-            out.append(r)
-    return out
-
-
-class FFmpegV4l2Capture:
-    def __init__(self, proc, width, height):
-        self._proc = proc
-        self.width = width
-        self.height = height
-        self._frame_size = width * height * 3
-
-    def isOpened(self):
-        return self._proc is not None and self._proc.poll() is None
-
-    def read(self):
-        if self._proc is None:
-            return False, None
-        raw = self._proc.stdout.read(self._frame_size)
-        if len(raw) != self._frame_size:
-            return False, None
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3))
-        return True, frame
-
-    def release(self):
-        if self._proc is None:
-            return
-        if self._proc.poll() is None:
-            self._proc.terminate()
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._proc.kill()
-        try:
-            self._proc.stdout.close()
-        except Exception:
-            pass
-        try:
-            self._proc.stderr.close()
-        except Exception:
-            pass
-        self._proc = None
-
-
-def _try_ffmpeg_v4l2(device, logger, size_tries, fps):
-    """
-    Open /dev/video* via ffmpeg's v4l2 input. Works in many Docker setups where OpenCV's
-    VideoIO does not.
-    """
-    if not shutil.which("ffmpeg"):
-        logger.warning("ffmpeg not found in PATH; cannot use ffmpeg webcam capture.")
-        return None
-    if not os.path.exists(device):
-        return None
-    for w, h in size_tries:
-        for input_format in (None, "mjpeg", "yuyv422"):
-            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2"]
-            if input_format:
-                cmd += ["-input_format", input_format]
-            cmd += [
-                "-framerate",
-                str(fps),
-                "-video_size",
-                "{}x{}".format(w, h),
-                "-i",
-                device,
-                "-pix_fmt",
-                "bgr24",
-                "-f",
-                "rawvideo",
-                "-",
-            ]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.DEVNULL,
-            )
-            time.sleep(0.45)
-            if proc.poll() is not None:
-                err = proc.stderr.read().decode("utf-8", errors="replace")
-                logger.info(
-                    "ffmpeg failed %dx%d fmt=%s: %s",
-                    w,
-                    h,
-                    input_format,
-                    err[:300].replace("\n", " "),
-                )
-                continue
-            frame_size = w * h * 3
-            raw = proc.stdout.read(frame_size)
-            if len(raw) == frame_size:
-                logger.info(
-                    "Using ffmpeg v4l2 capture on %r at %dx%d (input_format=%s)",
-                    device,
-                    w,
-                    h,
-                    input_format,
-                )
-                # Avoid stderr PIPE filling and stalling ffmpeg on long runs.
-                threading.Thread(target=lambda: proc.stderr.read(), daemon=True).start()
-                return FFmpegV4l2Capture(proc, w, h)
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-    return None
-
-
-def open_webcam_capture(
-    camera_device,
-    camera_index,
-    logger,
-    use_ffmpeg_only=False,
-    webcam_size="640x480",
-    webcam_fps=30,
-):
-    """
-    Open a camera for --webcam. On Linux, prefer the V4L2 backend and try both device path
-    and numeric index. If OpenCV fails (common in Docker), fall back to ffmpeg v4l2.
-    """
-    first_wh = _parse_webcam_size(webcam_size)
-    size_tries = _webcam_size_tries(first_wh)
-
-    def _v4l_device_path():
-        if camera_device:
-            p = os.path.expanduser(camera_device)
-            if not os.path.exists(p):
-                raise FileNotFoundError(
-                    "Camera device not found: {!r}. Check the path and Docker --device.".format(p)
-                )
-            return p
-        return "/dev/video{}".format(camera_index)
-
-    vdev = _v4l_device_path()
-
-    if use_ffmpeg_only:
-        cap = _try_ffmpeg_v4l2(vdev, logger, size_tries, webcam_fps)
-        if cap is not None:
-            return cap
         raise RuntimeError(
-            "ffmpeg could not open {!r}. Install ffmpeg, check v4l2-ctl --list-devices for the "
-            "capture node, try --webcam-size 1280x720, and ensure the device is readable in the "
-            "container.".format(vdev)
+            "Could not open webcam (camera_index={!r}, camera_device={!r}). "
+            "Try another index or --camera-device from `v4l2-ctl --list-devices`.".format(
+                camera_index, camera_device
+            )
         )
-
-    if camera_device:
-        src_path = os.path.expanduser(camera_device)
-        attempts = []
-        m = re.match(r".*/video(\d+)$", src_path)
-        idx = int(m.group(1)) if m else None
-        if sys.platform.startswith("linux") and hasattr(cv2, "CAP_V4L2"):
-            attempts.append((src_path, cv2.CAP_V4L2, "V4L2 device path"))
-            if idx is not None:
-                attempts.append((idx, cv2.CAP_V4L2, "V4L2 numeric index"))
-        attempts.append((src_path, None, "default backend, device path"))
-        if idx is not None:
-            attempts.append((idx, None, "default backend, numeric index"))
-    else:
-        attempts = []
-        if sys.platform.startswith("linux") and hasattr(cv2, "CAP_V4L2"):
-            attempts.append((camera_index, cv2.CAP_V4L2, "V4L2 index"))
-        attempts.append((camera_index, None, "default index"))
-
-    for src, backend, label in attempts:
-        cap = _try_open_capture(src, backend, logger, label)
-        if cap is not None:
-            logger.info("Using camera %s (src=%r)", label, src)
-            return cap
-
-    logger.warning(
-        "OpenCV could not capture from the camera; trying ffmpeg v4l2 fallback (same as --webcam-use-ffmpeg)."
-    )
-    cap = _try_ffmpeg_v4l2(vdev, logger, size_tries, webcam_fps)
-    if cap is not None:
-        return cap
-
-    raise RuntimeError(
-        "Could not open camera with OpenCV or ffmpeg. Tried OpenCV: {}. "
-        "For v4l2: run `v4l2-ctl --list-devices` and use the /dev/video* line for **Video Capture** "
-        "(not metadata). Try: --webcam-use-ffmpeg --webcam-size 1280x720 --camera-device /dev/videoN. "
-        "Ensure ffmpeg is installed and the device is passed into Docker (e.g. --device /dev/videoN)."
-        .format(", ".join([a[2] for a in attempts]))
-    )
+    try:
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    except Exception:
+        pass
+    logger.info("Opened webcam with cv2.VideoCapture")
+    return cap
 
 
 if __name__ == "__main__":
@@ -390,7 +196,14 @@ if __name__ == "__main__":
 
     cfg = setup_cfg(args)
 
-    demo = VisualizationDemo(cfg, parallel=False)
+    if args.input_width < 1 or args.input_height < 1:
+        raise ValueError("--input-width and --input-height must be positive.")
+
+    demo = VisualizationDemo(
+        cfg,
+        parallel=False,
+        input_size=(args.input_width, args.input_height),
+    )
 
     if args.input:
         if len(args.input) == 1:
@@ -399,6 +212,11 @@ if __name__ == "__main__":
         for path in tqdm.tqdm(args.input, disable=not args.output):
             # use PIL, to be consistent with evaluation
             img = read_image(path, format="BGR")
+            img = cv2.resize(
+                img,
+                (args.input_width, args.input_height),
+                interpolation=cv2.INTER_LINEAR,
+            )
             start_time = time.time()
             predictions, visualized_output = demo.run_on_image(img)
             logger.info(
@@ -427,20 +245,12 @@ if __name__ == "__main__":
     elif args.webcam:
         assert args.input is None, "Cannot have both --input and --webcam!"
         assert args.output is None, "output not yet supported with --webcam!"
-        cam = open_webcam_capture(
-            args.camera_device,
-            args.camera_index,
-            logger,
-            use_ffmpeg_only=args.webcam_use_ffmpeg,
-            webcam_size=args.webcam_size,
-            webcam_fps=args.webcam_fps,
-        )
+        cam = open_webcam_cv2(args.camera_device, args.camera_index, logger)
         fps_ema = None
-        prev_t = time.perf_counter()
-        for vis in tqdm.tqdm(demo.run_on_video(cam)):
-            now = time.perf_counter()
-            fps_ema = _update_fps_ema(fps_ema, now - prev_t)
-            prev_t = now
+        for vis, infer_sec in tqdm.tqdm(
+            demo.run_on_video(cam, yield_inference_time=True), desc="webcam"
+        ):
+            fps_ema = _update_fps_ema(fps_ema, infer_sec)
             if not args.no_fps_overlay and fps_ema is not None:
                 _draw_fps_overlay(vis, fps_ema)
             cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -451,11 +261,10 @@ if __name__ == "__main__":
         cv2.destroyAllWindows()
     elif args.video_input:
         video = cv2.VideoCapture(args.video_input)
-        width = 512 #int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = 256 #int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        width = args.input_width
+        height = args.input_height
         frames_per_second = video.get(cv2.CAP_PROP_FPS)
         num_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-        print(width, height)
 
         basename = os.path.basename(args.video_input)
         codec, file_ext = (
@@ -481,14 +290,13 @@ if __name__ == "__main__":
             )
         assert os.path.isfile(args.video_input)
         fps_ema = None
-        prev_t = time.perf_counter()
-        for vis_frame in tqdm.tqdm(demo.run_on_video(video), total=num_frames):
-            now = time.perf_counter()
-            fps_ema = _update_fps_ema(fps_ema, now - prev_t)
-            prev_t = now
+        for vis_frame, infer_sec in tqdm.tqdm(
+            demo.run_on_video(video, yield_inference_time=True), total=num_frames, desc="video"
+        ):
             if args.output:
                 output_file.write(vis_frame)
             else:
+                fps_ema = _update_fps_ema(fps_ema, infer_sec)
                 if not args.no_fps_overlay and fps_ema is not None:
                     _draw_fps_overlay(vis_frame, fps_ema)
                 cv2.namedWindow(basename, cv2.WINDOW_NORMAL)

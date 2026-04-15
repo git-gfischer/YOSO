@@ -2,6 +2,7 @@
 import atexit
 import bisect
 import multiprocessing as mp
+import time
 from collections import deque
 import cv2
 import torch
@@ -13,19 +14,21 @@ from detectron2.utils.visualizer import ColorMode, Visualizer
 
 
 class VisualizationDemo(object):
-    def __init__(self, cfg, instance_mode=ColorMode.IMAGE, parallel=False):
+    def __init__(self, cfg, instance_mode=ColorMode.IMAGE, parallel=False, input_size=(512, 256)):
         """
         Args:
             cfg (CfgNode):
             instance_mode (ColorMode):
             parallel (bool): whether to run the model in different processes from visualization.
                 Useful since the visualization logic can be slow.
+            input_size (tuple): (width, height) to resize each video/webcam frame before inference.
         """
         self.metadata = MetadataCatalog.get(
             cfg.DATASETS.TEST[0] if len(cfg.DATASETS.TEST) else "__unused"
         )
         self.cpu_device = torch.device("cpu")
         self.instance_mode = instance_mode
+        self._input_size = (int(input_size[0]), int(input_size[1]))
 
         self.parallel = parallel
         if parallel:
@@ -66,24 +69,28 @@ class VisualizationDemo(object):
         return predictions, vis_output
 
     def _frame_from_video(self, video):
+        w, h = self._input_size
         while video.isOpened():
             success, frame = video.read()
             if success:
-                frame = cv2.resize(frame, (512,256))
+                frame = cv2.resize(frame, (w, h), interpolation=cv2.INTER_LINEAR)
                 yield frame
             else:
                 break
 
-    def run_on_video(self, video):
+    def run_on_video(self, video, yield_inference_time=False):
         """
         Visualizes predictions on frames of the input video.
 
         Args:
             video (cv2.VideoCapture): a :class:`VideoCapture` object, whose source can be
                 either a webcam or a video file.
+            yield_inference_time (bool): If True, yields (vis_frame, inference_time_sec) where
+                inference_time_sec is only the model forward pass (not visualization or I/O).
 
         Yields:
-            ndarray: BGR visualizations of each video frame.
+            ndarray: BGR visualizations of each video frame; or (ndarray, float) if
+                yield_inference_time is True (non-parallel mode only).
         """
         video_visualizer = VideoVisualizer(self.metadata, self.instance_mode)
 
@@ -108,6 +115,8 @@ class VisualizationDemo(object):
 
         frame_gen = self._frame_from_video(video)
         if self.parallel:
+            if yield_inference_time:
+                raise ValueError("yield_inference_time is not supported when parallel=True")
             buffer_size = self.predictor.default_buffer_size
 
             frame_data = deque()
@@ -127,7 +136,14 @@ class VisualizationDemo(object):
                 yield process_predictions(frame, predictions)
         else:
             for frame in frame_gen:
-                yield process_predictions(frame, self.predictor(frame))
+                t0 = time.perf_counter()
+                predictions = self.predictor(frame)
+                infer_sec = time.perf_counter() - t0
+                vis = process_predictions(frame, predictions)
+                if yield_inference_time:
+                    yield vis, infer_sec
+                else:
+                    yield vis
 
 
 class AsyncPredictor:
