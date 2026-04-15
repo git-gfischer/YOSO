@@ -81,9 +81,9 @@ class SemSegEvaluator(DatasetEvaluator):
         """
         for input, output in zip(inputs, outputs):
             output = output["sem_seg"].argmax(dim=0).to(self._cpu_device)
-            pred = np.array(output, dtype=np.int)
+            pred = np.array(output, dtype=np.int64)
             with PathManager.open(self.input_file_to_gt_file[input["file_name"]], "rb") as f:
-                gt = np.array(Image.open(f), dtype=np.int)
+                gt = np.array(Image.open(f), dtype=np.int64)
 
             gt[gt == self._ignore_label] = self._num_classes
 
@@ -121,12 +121,12 @@ class SemSegEvaluator(DatasetEvaluator):
             with PathManager.open(file_path, "w") as f:
                 f.write(json.dumps(self._predictions))
 
-        acc = np.full(self._num_classes, np.nan, dtype=np.float)
-        iou = np.full(self._num_classes, np.nan, dtype=np.float)
-        tp = self._conf_matrix.diagonal()[:-1].astype(np.float)
-        pos_gt = np.sum(self._conf_matrix[:-1, :-1], axis=0).astype(np.float)
+        acc = np.full(self._num_classes, np.nan, dtype=np.float64)
+        iou = np.full(self._num_classes, np.nan, dtype=np.float64)
+        tp = self._conf_matrix.diagonal()[:-1].astype(np.float64)
+        pos_gt = np.sum(self._conf_matrix[:-1, :-1], axis=0).astype(np.float64)
         class_weights = pos_gt / np.sum(pos_gt)
-        pos_pred = np.sum(self._conf_matrix[:-1, :-1], axis=1).astype(np.float)
+        pos_pred = np.sum(self._conf_matrix[:-1, :-1], axis=1).astype(np.float64)
         acc_valid = pos_gt > 0
         acc[acc_valid] = tp[acc_valid] / pos_gt[acc_valid]
         iou_valid = (pos_gt + pos_pred) > 0

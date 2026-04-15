@@ -137,29 +137,35 @@ def get_model_zoo_configs() -> List[str]:
     detectron2/model_zoo.
     """
 
-    # Use absolute paths while symlinking.
-    source_configs_dir = path.join(path.dirname(path.realpath(__file__)), "configs")
-    destination = path.join(
-        path.dirname(path.realpath(__file__)), "detectron2", "model_zoo", "configs"
-    )
-    # Symlink the config directory inside package to have a cleaner pip install.
+    this_dir = path.dirname(path.realpath(__file__))
+    source_configs_dir = path.join(this_dir, "configs")
+    if not path.isdir(source_configs_dir):
+        alt = path.join(this_dir, "projects", "YOSO", "configs")
+        if path.isdir(alt):
+            source_configs_dir = alt
 
-    # Remove stale symlink/directory from a previous build.
-    if path.exists(source_configs_dir):
+    model_zoo_dir = path.join(this_dir, "detectron2", "model_zoo")
+    destination = path.join(model_zoo_dir, "configs")
+
+    # Remove stale symlink/directory from a previous build (including broken symlinks).
+    if path.lexists(destination):
         if path.islink(destination):
             os.unlink(destination)
         elif path.isdir(destination):
             shutil.rmtree(destination)
 
-    if not path.exists(destination):
+    if path.isdir(source_configs_dir):
         try:
-            os.symlink(source_configs_dir, destination)
+            os.symlink(path.abspath(source_configs_dir), destination)
         except OSError:
             # Fall back to copying if symlink fails: ex. on Windows.
             shutil.copytree(source_configs_dir, destination)
 
-    config_paths = glob.glob("configs/**/*.yaml", recursive=True)
-    return config_paths
+    if not path.isdir(destination):
+        return []
+
+    abs_paths = glob.glob(path.join(destination, "**", "*.yaml"), recursive=True)
+    return [path.relpath(p, model_zoo_dir) for p in abs_paths]
 
 
 setup(
