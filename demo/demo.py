@@ -187,12 +187,22 @@ def open_webcam_cv2(camera_device, camera_index, logger):
     return cap
 
 
+
+def _args_for_logging(args_ns):
+    """Return an argparse.Namespace clone safe to stringify (avoid dumping huge --input lists)."""
+    out = argparse.Namespace(**vars(args_ns))
+    inp = getattr(out, "input", None)
+    if isinstance(inp, (list, tuple)) and len(inp) > 1:
+        out.input = "[<{} input paths>]".format(len(inp))
+    return out
+
+
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
     args = get_parser().parse_args()
     setup_logger(name="fvcore")
     logger = setup_logger()
-    logger.info("Arguments: " + str(args))
+    logger.info("Arguments: {}".format(_args_for_logging(args)))
 
     cfg = setup_cfg(args)
 
@@ -207,8 +217,12 @@ if __name__ == "__main__":
 
     if args.input:
         if len(args.input) == 1:
-            args.input = glob.glob(os.path.expanduser(args.input[0]))
-            assert args.input, "The input path(s) was not found"
+            input_pattern = os.path.expanduser(args.input[0])
+            args.input = glob.glob(input_pattern)
+            assert args.input, (
+                "No files matched {!r} (empty glob or path does not exist). "
+                "If your images are not *.jpg, set IMAGE_GLOB when using dataset_inference.sh."
+            ).format(input_pattern)
         for path in tqdm.tqdm(args.input, disable=not args.output):
             # use PIL, to be consistent with evaluation
             img = read_image(path, format="BGR")
