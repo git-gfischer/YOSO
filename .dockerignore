@@ -1,0 +1,11 @@
+tmp/
+.git/
+.gitignore
+
+# Exclude local build artifacts to avoid stale absolute CMake paths in image.
+cpp/build/
+**/CMakeCache.txt
+**/CMakeFiles/
+**/*.o
+**/*.so
+**/*.a

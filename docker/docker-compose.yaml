@@ -1,0 +1,25 @@
+services:
+  yoso:
+    container_name: yoso-cpp
+    build:
+      context: ..
+      dockerfile: docker/dockerfile
+    working_dir: /workspace/YOSO
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ~/.Xauthority:/root/.Xauthority:rw
+      - ..:/workspace/YOSO
+      - /dev:/dev
+    stdin_open: true
+    tty: true
+    ipc: host
+    privileged: true
+    network_mode: host
+    gpus: all
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility,video
+      - DISPLAY=${DISPLAY}
+      - LD_LIBRARY_PATH=/opt/onnxruntime/lib:/usr/local/cuda/lib64:/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}
+      - QT_X11_NO_MITSHM=1
+      - PATH=${PATH}

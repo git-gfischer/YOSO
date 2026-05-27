@@ -1,0 +1,61 @@
+FROM nvcr.io/nvidia/tensorrt:24.05-py3
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+    git \
+    pkg-config \
+    libopencv-dev \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Python deps for ONNX export + validation + TRT builder helpers.
+RUN python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install \
+      torch torchvision \
+      onnx onnxruntime-gpu onnxsim \
+      pycuda
+
+WORKDIR /workspace/YOSO
+
+# Copy project files into image (compose will also mount live workspace).
+COPY . /workspace/YOSO
+
+# Guard against accidental host-side CMake cache artifacts in context.
+RUN rm -rf /workspace/YOSO/cpp/build
+
+# Install ONNX Runtime C++ GPU SDK (for yoso_infer_ort --gpu).
+ENV ORT_VERSION=1.20.1
+RUN curl -L "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-x64-gpu-${ORT_VERSION}.tgz" \
+    -o /tmp/onnxruntime.tgz && \
+    mkdir -p /opt && \
+    tar -xzf /tmp/onnxruntime.tgz -C /opt && \
+    ln -s "/opt/onnxruntime-linux-x64-gpu-${ORT_VERSION}" /opt/onnxruntime && \
+    test -f "/opt/onnxruntime/lib/libonnxruntime.so" && \
+    test -f "/opt/onnxruntime/lib/libonnxruntime_providers_shared.so" && \
+    rm -f /tmp/onnxruntime.tgz
+
+# Build both C++ binaries during image build using split CMake targets:
+#   cpp/trt/CMakeLists.txt  -> yoso_infer_trt
+#   cpp/onnx/CMakeLists.txt -> yoso_infer_ort
+# TensorRT headers/libs are provided by the base image under /usr.
+RUN cmake -S cpp -B cpp/build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TRT=ON \
+      -DBUILD_ORT=ON \
+      -DTRT_ROOT=/usr \
+      -DORT_ROOT=/opt/onnxruntime && \
+    cmake --build cpp/build --target yoso_infer_trt yoso_infer_ort -j"$(nproc)" && \
+    test -f cpp/build/trt/yoso_infer_trt && test -f cpp/build/onnx/yoso_infer_ort && \
+    cp cpp/build/trt/yoso_infer_trt /usr/local/bin/yoso_infer_trt && \
+    cp cpp/build/onnx/yoso_infer_ort /usr/local/bin/yoso_infer_ort
+
+ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}
+CMD ["/bin/bash"]
