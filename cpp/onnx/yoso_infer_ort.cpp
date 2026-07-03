@@ -29,6 +29,9 @@
 #include <onnxruntime_cxx_api.h>
 #include <opencv2/opencv.hpp>
 
+#include "coco_vis.hpp"
+#include "infer_result.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
@@ -45,34 +48,13 @@
 // ─── constants ──────────────────────────────────────────────────
 static const int   NUM_KERNELS   = 100;
 static const int   NUM_CLASSES   = 134;
-static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f};
-static const float IMAGENET_STD[3]  = {0.229f, 0.224f, 0.225f};
+static const int   NUM_FG_CLASSES = 133;
+static const int   TOPK_DETECTIONS = 100;
+static const float YOSO_TEMPERATURE = 0.05f;
+static const float PIXEL_MEAN[3] = {123.675f, 116.280f, 103.530f};
+static const float PIXEL_STD[3]  = {58.395f, 57.120f, 57.375f};
 
-static const std::vector<std::string> CLASS_NAMES = {
-    "person","bicycle","car","motorcycle","airplane","bus","train","truck",
-    "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
-    "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra",
-    "giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
-    "skis","snowboard","sports ball","kite","baseball bat","baseball glove",
-    "skateboard","surfboard","tennis racket","bottle","wine glass","cup",
-    "fork","knife","spoon","bowl","banana","apple","sandwich","orange",
-    "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch",
-    "potted plant","bed","dining table","toilet","tv","laptop","mouse",
-    "remote","keyboard","cell phone","microwave","oven","toaster","sink",
-    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
-    "toothbrush",
-    "banner","blanket","bridge","cardboard","counter","curtain","door-stuff",
-    "floor-wood","flower","fruit","gravel","house","light","mirror-stuff",
-    "net","pillow","platform","playingfield","railroad","river","road",
-    "roof","sand","sea","shelf","snow","stairs","tent","towel",
-    "wall-brick","wall-stone","wall-tile","wall-wood","water-other",
-    "window-blind","window-other","tree-merged","fence-merged","ceiling-merged",
-    "sky-other-merged","cabinet-merged","table-merged","floor-other-merged",
-    "pavement-merged","mountain-merged","grass-merged","dirt-merged",
-    "paper-merged","food-other-merged","building-other-merged",
-    "rock-merged","wall-other-merged","rug-merged",
-    "background"
-};
+// COCO class names in cocovis::class_names()
 
 // ─── Detection ──────────────────────────────────────────────────
 struct Detection {
@@ -164,7 +146,8 @@ public:
         for (const auto& n : output_names_store_) output_names_.push_back(n.c_str());
     }
 
-    std::vector<Detection> infer(const cv::Mat& bgr_image) {
+    InferResult<Detection> infer(const cv::Mat& bgr_image) {
+        InferResult<Detection> result;
         auto t0 = now_ms();
 
         // ── 1. pre-process ───────────────────────────────────────
@@ -200,14 +183,22 @@ public:
         int mask_w = static_cast<int>(masks_shape[3]);
 
         // ── 5. post-process ──────────────────────────────────────
-        auto dets = postprocess(logits_ptr, masks_ptr,
-                                bgr_image.rows, bgr_image.cols,
-                                mask_h, mask_w);
+        result.detections = postprocess(logits_ptr, masks_ptr,
+                                        bgr_image.rows, bgr_image.cols,
+                                        mask_h, mask_w);
         auto t3 = now_ms();
 
-        std::cout << "[ORT] pre=" << int(t1-t0) << "ms  infer=" << int(t2-t1)
-                  << "ms  post=" << int(t3-t2) << "ms  total=" << int(t3-t0) << "ms\n";
-        return dets;
+        result.preprocess_ms  = t1 - t0;
+        result.infer_ms       = t2 - t1;
+        result.postprocess_ms = t3 - t2;
+        result.total_ms       = t3 - t0;
+        std::cout << "[ORT] pre=" << int(result.preprocess_ms)
+                  << "ms  infer=" << int(result.infer_ms)
+                  << "ms  post=" << int(result.postprocess_ms)
+                  << "ms  total=" << int(result.total_ms)
+                  << "ms  fps=" << std::fixed << std::setprecision(1)
+                  << result.fps() << '\n';
+        return result;
     }
 
 private:
@@ -218,9 +209,9 @@ private:
             for (int x = 0; x < W; ++x) {
                 auto px  = bgr.at<cv::Vec3b>(y, x);
                 int  idx = y * W + x;
-                out[0 * H*W + idx] = (px[2] / 255.f - IMAGENET_MEAN[0]) / IMAGENET_STD[0];
-                out[1 * H*W + idx] = (px[1] / 255.f - IMAGENET_MEAN[1]) / IMAGENET_STD[1];
-                out[2 * H*W + idx] = (px[0] / 255.f - IMAGENET_MEAN[2]) / IMAGENET_STD[2];
+                out[0 * H*W + idx] = (px[2] - PIXEL_MEAN[0]) / PIXEL_STD[0];
+                out[1 * H*W + idx] = (px[1] - PIXEL_MEAN[1]) / PIXEL_STD[1];
+                out[2 * H*W + idx] = (px[0] - PIXEL_MEAN[2]) / PIXEL_STD[2];
             }
         }
         return out;
@@ -235,39 +226,65 @@ private:
     {
         std::vector<Detection> results;
 
+        struct Cand { int kernel; int cls; float cls_score; };
+        std::vector<Cand> cands;
+        cands.reserve(NUM_KERNELS * NUM_FG_CLASSES);
+
         for (int k = 0; k < NUM_KERNELS; ++k) {
-            float* row   = logits + k * NUM_CLASSES;
-            float  max_v = *std::max_element(row, row + NUM_CLASSES);
-            float  sum   = 0.f;
+            float* row = logits + k * NUM_CLASSES;
+            float max_v = row[0] / YOSO_TEMPERATURE;
+            for (int c = 1; c < NUM_CLASSES; ++c)
+                max_v = std::max(max_v, row[c] / YOSO_TEMPERATURE);
+
+            float sum = 0.f;
             std::vector<float> probs(NUM_CLASSES);
             for (int c = 0; c < NUM_CLASSES; ++c) {
-                probs[c]  = std::exp(row[c] - max_v);
-                sum      += probs[c];
+                probs[c] = std::exp(row[c] / YOSO_TEMPERATURE - max_v);
+                sum += probs[c];
             }
-            for (auto& p : probs) p /= sum;
+            for (auto& p : probs) p /= std::max(sum, 1e-8f);
 
-            int   best_c = int(std::max_element(probs.begin(),
-                                                probs.end()-1) - probs.begin());
-            float score  = probs[best_c];
-            if (score < score_thresh_) continue;
+            for (int c = 0; c < NUM_FG_CLASSES; ++c)
+                cands.push_back({k, c, probs[c]});
+        }
 
-            // Build low-res mask
-            float* mptr = masks + k * mask_h * mask_w;
+        const size_t top_n = std::min<size_t>(TOPK_DETECTIONS, cands.size());
+        std::partial_sort(cands.begin(), cands.begin() + top_n, cands.end(),
+                          [](const Cand& a, const Cand& b){ return a.cls_score > b.cls_score; });
+
+        for (size_t i = 0; i < top_n; ++i) {
+            const auto& cand = cands[i];
+            if (cand.cls_score < score_thresh_) continue;
+
+            float* mptr = masks + cand.kernel * mask_h * mask_w;
             cv::Mat low(mask_h, mask_w, CV_32FC1);
-            for (int i = 0; i < mask_h * mask_w; ++i)
-                low.at<float>(i / mask_w, i % mask_w) = sigmoid(mptr[i]);
+            float mask_sum = 0.f;
+            int mask_count = 0;
+            for (int y = 0; y < mask_h; ++y) {
+                for (int x = 0; x < mask_w; ++x) {
+                    const float logit = mptr[y * mask_w + x];
+                    const float prob = sigmoid(logit);
+                    low.at<float>(y, x) = prob;
+                    if (logit > 0.f) { mask_sum += prob; ++mask_count; }
+                }
+            }
+            if (mask_count == 0) continue;
 
-            // Upsample
+            const float final_score = cand.cls_score * (mask_sum / float(mask_count));
+            if (final_score < score_thresh_) continue;
+
             cv::Mat full;
             cv::resize(low, full, {orig_w, orig_h}, 0, 0, cv::INTER_LINEAR);
             cv::Mat binary;
             cv::threshold(full, binary, mask_thresh_, 255, cv::THRESH_BINARY);
             binary.convertTo(binary, CV_8UC1);
 
-            std::string name = (best_c < (int)CLASS_NAMES.size())
-                               ? CLASS_NAMES[best_c] : std::to_string(best_c);
-            results.push_back({best_c, score, name, binary});
+            const auto& names = cocovis::class_names();
+            std::string name = (cand.cls < (int)names.size())
+                               ? names[cand.cls] : std::to_string(cand.cls);
+            results.push_back({cand.cls, final_score, name, binary});
         }
+
         std::sort(results.begin(), results.end(),
                   [](auto& a, auto& b){ return a.score > b.score; });
         return results;
@@ -280,51 +297,6 @@ private:
     int   input_h_, input_w_;
     float score_thresh_, mask_thresh_;
 };
-
-// ─── visualisation ───────────────────────────────────────────────
-static cv::Mat visualise(const cv::Mat& image,
-                          const std::vector<Detection>& dets)
-{
-    static const std::vector<cv::Scalar> PALETTE = {
-        {255,56,56},{255,157,151},{255,112,31},{255,178,29},{207,210,49},
-        {72,249,10},{146,204,23},{61,219,134},{26,147,52},{0,212,187},
-        {44,153,168},{0,194,255},{52,69,147},{100,115,255},{0,24,236},
-        {132,56,255},{82,0,133},{203,56,255},{255,149,200},{255,55,199}
-    };
-    cv::Mat vis = image.clone();
-    for (size_t i = 0; i < dets.size(); ++i) {
-        const auto& d = dets[i];
-        cv::Scalar  c = PALETTE[i % PALETTE.size()];
-
-        if (!d.mask.empty()) {
-            cv::Mat colour(vis.size(), CV_32FC3, c);
-            cv::Mat mask3; cv::cvtColor(d.mask, mask3, cv::COLOR_GRAY2BGR);
-            cv::Mat nm; mask3.convertTo(nm, CV_32FC3, 1.f / 255.f);
-            cv::Mat vis_f; vis.convertTo(vis_f, CV_32FC3);
-            cv::addWeighted(vis_f, 1.0, colour.mul(nm), 0.4, 0.0, vis_f);
-            vis_f.convertTo(vis, CV_8UC3);
-        }
-
-        std::vector<std::vector<cv::Point>> cnts;
-        cv::findContours(d.mask, cnts, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
-        if (!cnts.empty()) {
-            cv::Rect bbox = cv::boundingRect(cnts[0]);
-            for (auto& cnt : cnts) bbox |= cv::boundingRect(cnt);
-            cv::rectangle(vis, bbox, c, 2);
-
-            std::ostringstream lbl;
-            lbl << d.class_name << " " << std::fixed
-                << std::setprecision(2) << d.score;
-            int bl = 0;
-            auto ts = cv::getTextSize(lbl.str(), cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &bl);
-            cv::rectangle(vis, {bbox.x, bbox.y-ts.height-6},
-                          {bbox.x+ts.width+4, bbox.y}, c, -1);
-            cv::putText(vis, lbl.str(), {bbox.x+2, bbox.y-4},
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1);
-        }
-    }
-    return vis;
-}
 
 // ─── main ────────────────────────────────────────────────────────
 static void print_usage(const char* prog) {
@@ -391,16 +363,16 @@ int main(int argc, char** argv) {
         if (image.empty()) { std::cerr << "Cannot read: " << image_path << '\n'; return 1; }
         std::cout << "[ORT] Image: " << image.cols << "×" << image.rows << '\n';
 
-        auto dets = yoso.infer(image);
-        std::cout << "[ORT] Detections: " << dets.size() << '\n';
-        for (size_t i = 0; i < dets.size(); ++i)
-            std::cout << "  [" << i << "] " << dets[i].class_name
-                      << "  score=" << dets[i].score << '\n';
+        auto result = yoso.infer(image);
+        std::cout << "[ORT] Detections: " << result.detections.size() << '\n';
+        for (size_t i = 0; i < result.detections.size(); ++i)
+            std::cout << "  [" << i << "] " << result.detections[i].class_name
+                      << "  score=" << result.detections[i].score << '\n';
 
         std::filesystem::create_directories(out_dir);
         std::string stem = std::filesystem::path(image_path).stem().string();
         std::string out_path = out_dir + "/" + stem + "_yoso_ort.jpg";
-        cv::imwrite(out_path, visualise(image, dets));
+        cv::imwrite(out_path, cocovis::visualise(image, result.detections));
         std::cout << "[ORT] Saved → " << out_path << '\n';
     } else {
         cv::VideoCapture cap(camera_id);
@@ -424,11 +396,17 @@ int main(int argc, char** argv) {
             cap >> frame;
             if (frame.empty()) break;
 
-            auto dets = yoso.infer(frame);
-            last_vis = visualise(frame, dets);
-
-            cv::putText(last_vis, "Press q/ESC to quit",
+            auto result = yoso.infer(frame);
+            last_vis = cocovis::visualise(frame, result.detections);
+            std::ostringstream hud;
+            hud << "FPS: " << std::fixed << std::setprecision(1) << result.fps()
+                << "  det=" << result.detections.size()
+                << "  total=" << std::setprecision(0) << result.total_ms << "ms";
+            cv::putText(last_vis, hud.str(),
                         {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                        {0, 255, 0}, 2);
+            cv::putText(last_vis, "Press q/ESC to quit",
+                        {10, 60}, cv::FONT_HERSHEY_SIMPLEX, 0.8,
                         {255, 255, 255}, 2);
             cv::imshow("YOSO ORT Webcam", last_vis);
 

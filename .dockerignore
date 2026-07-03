@@ -1,4 +1,3 @@
-tmp/
 .git/
 .gitignore
 
@@ -9,3 +8,11 @@ cpp/build/
 **/*.o
 **/*.so
 **/*.a
+
+# Rebuild ONNX/engine inside the image (avoid baking stale host exports).
+models/*.onnx
+models/*.engine
+
+# Drop heavy non-essential outputs inside vendored YOSO sources.
+vendor/yoso/**/output/
+vendor/yoso/**/__pycache__/

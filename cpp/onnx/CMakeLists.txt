@@ -29,6 +29,7 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
 
   add_executable(yoso_infer_ort yoso_infer_ort.cpp)
   target_include_directories(yoso_infer_ort PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../common
     ${ORT_INCLUDE_DIR}
     ${OpenCV_INCLUDE_DIRS}
   )

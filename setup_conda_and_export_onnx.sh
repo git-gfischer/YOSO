@@ -18,6 +18,7 @@ Options:
   --width <int>             Static export width (default: 512)
   --opset <int>             ONNX opset version (default: 18)
   --dcn-mode <mode>         DCN export mode: native|custom|gridsampl (default: native)
+  --legacy-export           Use approximate model_arch export (not recommended)
   --dynamic                 Export dynamic-shape ONNX
   --simplify                Enable onnxsim simplification (default: enabled)
   --no-simplify             Disable onnxsim simplification
@@ -38,6 +39,7 @@ HEIGHT="480"
 WIDTH="640"
 OPSET="18"
 DCN_MODE="native"
+LEGACY_EXPORT=0
 DYNAMIC=0
 SIMPLIFY=1
 SKIP_CONDA=0
@@ -77,6 +79,10 @@ while [[ $# -gt 0 ]]; do
     --dcn-mode)
       DCN_MODE="$2"
       shift 2
+      ;;
+    --legacy-export)
+      LEGACY_EXPORT=1
+      shift
       ;;
     --dynamic)
       DYNAMIC=1
@@ -133,19 +139,34 @@ fi
 "${PIP_BIN}" install onnxsim
 "${PIP_BIN}" install onnxruntime-gpu
 
-# Step 2 – Export to ONNX (configurable)
-EXPORT_CMD=(
-  "${PYTHON_BIN}" "${SCRIPT_DIR}/convertion/export_to_onnx.py"
-  --checkpoint "${CHECKPOINT}"
-  --output "${OUTPUT}"
-  --opset "${OPSET}"
-  --dcn-mode "${DCN_MODE}"
-)
-
-if [[ "${DYNAMIC}" -eq 1 ]]; then
-  EXPORT_CMD+=(--dynamic)
+# Step 2 – Export to ONNX
+if [[ "${LEGACY_EXPORT}" -eq 1 ]]; then
+  echo "[WARN] Using legacy approximate export (model_arch.py)."
+  EXPORT_CMD=(
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/convertion/export_to_onnx.py"
+    --checkpoint "${CHECKPOINT}"
+    --output "${OUTPUT}"
+    --opset "${OPSET}"
+    --dcn-mode "${DCN_MODE}"
+  )
+  if [[ "${DYNAMIC}" -eq 1 ]]; then
+    EXPORT_CMD+=(--dynamic)
+  else
+    EXPORT_CMD+=(--height "${HEIGHT}" --width "${WIDTH}")
+  fi
 else
-  EXPORT_CMD+=(--height "${HEIGHT}" --width "${WIDTH}")
+  echo "[INFO] Using official Detectron2 YOSO export."
+  EXPORT_CMD=(
+    env PYTHONPATH="${SCRIPT_DIR}/vendor/yoso:${SCRIPT_DIR}/vendor/yoso/projects/YOSO:${PYTHONPATH:-}"
+    "${PYTHON_BIN}" "${SCRIPT_DIR}/convertion/export_yoso_detectron2_onnx.py"
+    --checkpoint "${CHECKPOINT}"
+    --output "${OUTPUT}"
+    --height "${HEIGHT}"
+    --width "${WIDTH}"
+    --opset "${OPSET}"
+    --dcn-mode gridsampl
+    --device cpu
+  )
 fi
 
 if [[ "${SIMPLIFY}" -eq 1 ]]; then

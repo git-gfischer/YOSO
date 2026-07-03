@@ -4,6 +4,25 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
+# Model / build knobs (override at build time with --build-arg).
+ARG YOSO_CHECKPOINT=models/yoso_res50_coco.pth
+ARG YOSO_ONNX=models/yoso_res50.onnx
+ARG YOSO_ENGINE=models/yoso_res50.engine
+ARG YOSO_HEIGHT=480
+ARG YOSO_WIDTH=640
+ARG YOSO_OPSET=18
+ARG BUILD_ENGINE=0
+ARG BUILD_CPP=1
+
+ENV YOSO_CHECKPOINT=${YOSO_CHECKPOINT} \
+    YOSO_ONNX=${YOSO_ONNX} \
+    YOSO_ENGINE=${YOSO_ENGINE} \
+    YOSO_HEIGHT=${YOSO_HEIGHT} \
+    YOSO_WIDTH=${YOSO_WIDTH} \
+    YOSO_OPSET=${YOSO_OPSET} \
+    BUILD_ENGINE=${BUILD_ENGINE} \
+    BUILD_CPP=${BUILD_CPP}
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     cmake \
@@ -16,20 +35,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
-# Python deps for ONNX export + validation + TRT builder helpers.
+# Python deps for ONNX export, validation, and TRT builder helpers.
 RUN python3 -m pip install --upgrade pip setuptools wheel && \
     python3 -m pip install \
       torch torchvision \
       onnx onnxruntime-gpu onnxsim \
-      pycuda
+      pycuda tensorrt \
+      fvcore iopath pyyaml omegaconf yacs tabulate termcolor cloudpickle hydra-core \
+      timm ninja
 
 WORKDIR /workspace/YOSO
 
-# Copy project files into image (compose will also mount live workspace).
+# Copy project (checkpoint must be present under models/).
 COPY . /workspace/YOSO
 
-# Guard against accidental host-side CMake cache artifacts in context.
-RUN rm -rf /workspace/YOSO/cpp/build
+# vendor/yoso/ (detectron2 + YOSO) is not in git — clone if absent from build context.
+RUN chmod +x /workspace/YOSO/docker/fetch_yoso_sources.sh && \
+    bash /workspace/YOSO/docker/fetch_yoso_sources.sh
+
+# Detectron2 + YOSO (needed for correct ONNX export from real architecture).
+RUN test -f /workspace/YOSO/vendor/yoso/setup.py && \
+    python3 -m pip install -e /workspace/YOSO/vendor/yoso --no-build-isolation
 
 # Install ONNX Runtime C++ GPU SDK (for yoso_infer_ort --gpu).
 ENV ORT_VERSION=1.20.1
@@ -42,20 +68,15 @@ RUN curl -L "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_V
     test -f "/opt/onnxruntime/lib/libonnxruntime_providers_shared.so" && \
     rm -f /tmp/onnxruntime.tgz
 
-# Build both C++ binaries during image build using split CMake targets:
-#   cpp/trt/CMakeLists.txt  -> yoso_infer_trt
-#   cpp/onnx/CMakeLists.txt -> yoso_infer_ort
-# TensorRT headers/libs are provided by the base image under /usr.
-RUN cmake -S cpp -B cpp/build \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DBUILD_TRT=ON \
-      -DBUILD_ORT=ON \
-      -DTRT_ROOT=/usr \
-      -DORT_ROOT=/opt/onnxruntime && \
-    cmake --build cpp/build --target yoso_infer_trt yoso_infer_ort -j"$(nproc)" && \
-    test -f cpp/build/trt/yoso_infer_trt && test -f cpp/build/onnx/yoso_infer_ort && \
-    cp cpp/build/trt/yoso_infer_trt /usr/local/bin/yoso_infer_trt && \
-    cp cpp/build/onnx/yoso_infer_ort /usr/local/bin/yoso_infer_ort
+# ONNX export → TRT engine → C++ binaries (single orchestrated script).
+RUN rm -rf /workspace/YOSO/cpp/build && \
+    chmod +x /workspace/YOSO/docker/build_all.sh && \
+    bash /workspace/YOSO/docker/build_all.sh
 
 ENV LD_LIBRARY_PATH=/opt/onnxruntime/lib:${LD_LIBRARY_PATH}
+ENV PATH="/usr/local/bin:${PATH}"
+
+RUN chmod +x /workspace/YOSO/docker/entrypoint.sh /workspace/YOSO/docker/ensure_engine.sh
+
+ENTRYPOINT ["/workspace/YOSO/docker/entrypoint.sh"]
 CMD ["/bin/bash"]

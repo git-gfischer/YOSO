@@ -18,6 +18,8 @@ Options:
   --engine <path>        Engine output path
                          fp32 default: models/yoso_res50.engine
                          fp16 default: models/yoso_res50_fp16.engine
+  --height <int>         Static input height for fp32 build (default: 480)
+  --width  <int>         Static input width  for fp32 build (default: 640)
   --min <shape>          FP16 min shape (default: 1,3,384,384)
   --opt <shape>          FP16 opt shape (default: 1,3,512,512)
   --max <shape>          FP16 max shape (default: 1,3,768,768)
@@ -54,6 +56,8 @@ WORKSPACE="4096"
 INSTALL_DEPS=1
 CUSTOM_ONNX=""
 CUSTOM_ENGINE=""
+HEIGHT="480"
+WIDTH="640"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -67,6 +71,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --engine)
       CUSTOM_ENGINE="$2"
+      shift 2
+      ;;
+    --height)
+      HEIGHT="$2"
+      shift 2
+      ;;
+    --width)
+      WIDTH="$2"
       shift 2
       ;;
     --min)
@@ -118,7 +130,8 @@ if [[ "${MODE}" == "fp32" ]]; then
   "${PYTHON_BIN}" "${SCRIPT_DIR}/convertion/build_tensorrt_engine.py" \
       --onnx   "${ONNX_PATH}" \
       --engine "${ENGINE_PATH}" \
-      --static
+      --static \
+      --opt    "1,3,${HEIGHT},${WIDTH}"
 else
   ONNX_PATH="${CUSTOM_ONNX:-${ONNX_FP16}}"
   ENGINE_PATH="${CUSTOM_ENGINE:-${ENGINE_FP16}}"

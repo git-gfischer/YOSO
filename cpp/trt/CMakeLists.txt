@@ -34,6 +34,7 @@ if(TRT_INCLUDE_DIR AND TRT_LIBRARY)
 
   add_executable(yoso_infer_trt yoso_infer_trt.cpp)
   target_include_directories(yoso_infer_trt PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/../common
     ${TRT_INCLUDE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}

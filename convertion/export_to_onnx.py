@@ -1,6 +1,13 @@
 """
 export_to_onnx.py  –  Export YOSO model to ONNX
 
+WARNING: This script uses convertion/model_arch.py, an approximate reconstruction
+of YOSO that does NOT match the official Detectron2 architecture.  Exported
+models often produce flat class scores and saturated masks.
+
+For correct panoptic results, use:
+    python convertion/export_yoso_detectron2_onnx.py ...
+
 Usage
 -----
     python export_to_onnx.py \
