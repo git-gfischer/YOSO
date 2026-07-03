@@ -24,6 +24,9 @@
 #include <cuda_runtime_api.h>
 #include <opencv2/opencv.hpp>
 
+#include "coco_vis.hpp"
+#include "infer_result.hpp"
+
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -43,7 +46,10 @@
 
 // ─── constants ──────────────────────────────────────────────────
 static const int   NUM_KERNELS   = 100;
-static const int   NUM_CLASSES   = 134;  // 80 thing + 53 stuff + 1 bg
+static const int   NUM_CLASSES   = 134;  // 133 foreground + 1 background
+static const int   NUM_FG_CLASSES = 133;  // exclude background index 133
+static const int   TOPK_DETECTIONS = 100;
+static const float YOSO_TEMPERATURE = 0.05f;  // cfg MODEL.YOSO.TEMPERATIRE (YOSO-R50.yaml)
 // Detectron2-style normalization used by YOSO configs (RGB, 0..255 scale):
 //   PIXEL_MEAN: [123.675, 116.280, 103.530]
 //   PIXEL_STD : [58.395, 57.120, 57.375]
@@ -53,35 +59,7 @@ static const float PIXEL_STD[3]  = {58.395f, 57.120f, 57.375f};
 static const float IMAGENET_MEAN[3] = {0.485f, 0.456f, 0.406f};
 static const float IMAGENET_STD[3]  = {0.229f, 0.224f, 0.225f};
 
-// ─── COCO panoptic class names (134 total) ──────────────────────
-// Only first 80 thing classes shown here for brevity
-static const std::vector<std::string> CLASS_NAMES = {
-    "person","bicycle","car","motorcycle","airplane","bus","train","truck",
-    "boat","traffic light","fire hydrant","stop sign","parking meter","bench",
-    "bird","cat","dog","horse","sheep","cow","elephant","bear","zebra",
-    "giraffe","backpack","umbrella","handbag","tie","suitcase","frisbee",
-    "skis","snowboard","sports ball","kite","baseball bat","baseball glove",
-    "skateboard","surfboard","tennis racket","bottle","wine glass","cup",
-    "fork","knife","spoon","bowl","banana","apple","sandwich","orange",
-    "broccoli","carrot","hot dog","pizza","donut","cake","chair","couch",
-    "potted plant","bed","dining table","toilet","tv","laptop","mouse",
-    "remote","keyboard","cell phone","microwave","oven","toaster","sink",
-    "refrigerator","book","clock","vase","scissors","teddy bear","hair drier",
-    "toothbrush",
-    // stuff classes 81–133 abbreviated
-    "banner","blanket","bridge","cardboard","counter","curtain","door-stuff",
-    "floor-wood","flower","fruit","gravel","house","light","mirror-stuff",
-    "net","pillow","platform","playingfield","railroad","river","road",
-    "roof","sand","sea","shelf","snow","stairs","tent","towel",
-    "wall-brick","wall-stone","wall-tile","wall-wood","water-other",
-    "window-blind","window-other","tree-merged","fence-merged","ceiling-merged",
-    "sky-other-merged","cabinet-merged","table-merged","floor-other-merged",
-    "pavement-merged","mountain-merged","grass-merged","dirt-merged",
-    "paper-merged","food-other-merged","building-other-merged",
-    "rock-merged","wall-other-merged","rug-merged",
-    // background
-    "background"
-};
+// ─── COCO panoptic class names in cocovis::class_names() ────────
 
 // ─── TRT logger ─────────────────────────────────────────────────
 class Logger : public nvinfer1::ILogger {
@@ -141,8 +119,9 @@ public:
         for (auto& b : gpu_bufs_) b.free();
     }
 
-    // Infer on a single image; returns detections
-    std::vector<Detection> infer(const cv::Mat& bgr_image) {
+    // Infer on a single image.
+    InferResult<Detection> infer(const cv::Mat& bgr_image) {
+        InferResult<Detection> result;
         auto t0 = now_ms();
 
         // ── 1. pre-process ───────────────────────────────────────
@@ -192,14 +171,21 @@ public:
         }
 
         // ── 4. post-process ──────────────────────────────────────
-        auto dets = postprocess(logits_host, masks_host,
-                                bgr_image.rows, bgr_image.cols,
-                                mask_h, mask_w);
+        result.detections = postprocess(logits_host, masks_host,
+                                        bgr_image.rows, bgr_image.cols,
+                                        mask_h, mask_w);
 
         auto t2 = now_ms();
-        std::cout << "[YOSO] pre=" << (t1-t0) << "ms  infer=" << (t2-t1)
-                  << "ms  total=" << (t2-t0) << "ms\n";
-        return dets;
+        result.preprocess_ms  = t1 - t0;
+        result.postprocess_ms = t2 - t1;
+        result.infer_ms       = 0.0;
+        result.total_ms       = t2 - t0;
+        std::cout << "[YOSO] pre=" << result.preprocess_ms
+                  << "ms  post=" << result.postprocess_ms
+                  << "ms  total=" << result.total_ms
+                  << "ms  fps=" << std::fixed << std::setprecision(1)
+                  << result.fps() << '\n';
+        return result;
     }
 
 private:
@@ -466,7 +452,7 @@ private:
     // ── sigmoid helper ────────────────────────────────────────────
     static float sigmoid(float x) { return 1.f / (1.f + std::exp(-x)); }
 
-    // ── post-processing ──────────────────────────────────────────
+    // YOSO instance_inference-style post-processing (Detectron2 segmentator.py).
     std::vector<Detection> postprocess(
         const std::vector<float>& logits,
         const std::vector<float>& masks,
@@ -477,62 +463,88 @@ private:
         const int K = std::min({NUM_KERNELS, num_kernels_logits_, num_kernels_masks_});
         const int C = std::min(NUM_CLASSES, num_classes_logits_);
         if (K <= 0 || C <= 1) return results;
-        const int class_limit = things_only_ ? std::min(C, 80) : C;
-        if (class_limit <= 0) return results;
+
+        struct Cand {
+            int kernel;
+            int cls;
+            float cls_score;
+        };
+        std::vector<Cand> cands;
+        cands.reserve(static_cast<size_t>(K) * NUM_FG_CLASSES);
+
+        // Global top-k over all (kernel, class) pairs (exclude background class).
         for (int k = 0; k < K; ++k) {
-            // Softmax over NUM_CLASSES for kernel k
             std::vector<float> row(C);
             if (logits_layout_ == LogitsLayout::KERNELS_CLASSES) {
                 const float* src = logits.data() + k * num_classes_logits_;
-                std::copy(src, src + C, row.begin());
+                for (int c = 0; c < C; ++c) row[c] = src[c] / YOSO_TEMPERATURE;
             } else {
-                for (int c = 0; c < C; ++c) {
-                    row[c] = logits[c * num_kernels_logits_ + k];
-                }
+                for (int c = 0; c < C; ++c)
+                    row[c] = logits[c * num_kernels_logits_ + k] / YOSO_TEMPERATURE;
             }
+
             float max_v = *std::max_element(row.begin(), row.end());
-            float sum   = 0.f;
+            float sum = 0.f;
             std::vector<float> probs(C);
             for (int c = 0; c < C; ++c) {
                 probs[c] = std::exp(row[c] - max_v);
                 sum += probs[c];
             }
-            for (auto& p : probs) p /= sum;
+            for (auto& p : probs) p /= std::max(sum, 1e-8f);
 
-            // Best class (exclude background = last class)
-            // Exclude background and optionally exclude stuff classes.
-            int search_end = std::min(class_limit, C - 1);
-            int   cls = int(std::max_element(probs.begin(),
-                        probs.begin() + search_end) - probs.begin());
-            float score  = probs[cls];
-            if (score < score_thresh_) continue;
-
-            // Build mask
-            const float* mask_ptr = masks.data() + k * mask_h * mask_w;
-            cv::Mat low_mask(mask_h, mask_w, CV_32FC1);
-            for (int i = 0; i < mask_h * mask_w; ++i)
-                low_mask.at<float>(i / mask_w, i % mask_w) = sigmoid(mask_ptr[i]);
-
-            // Upsample to original resolution
-            cv::Mat full_mask;
-            cv::resize(low_mask, full_mask, {orig_w, orig_h},
-                       0, 0, cv::INTER_LINEAR);
-
-            cv::Mat binary_mask;
-            cv::threshold(full_mask, binary_mask, mask_thresh_, 255,
-                          cv::THRESH_BINARY);
-            binary_mask.convertTo(binary_mask, CV_8UC1);
-            const float area_ratio =
-                float(cv::countNonZero(binary_mask)) / float(orig_h * orig_w);
-            if (area_ratio < min_area_ratio_ || area_ratio > max_area_ratio_) continue;
-
-            std::string name = (cls < (int)CLASS_NAMES.size())
-                               ? CLASS_NAMES[cls] : std::to_string(cls);
-
-            results.push_back({cls, score, name, binary_mask});
+            const int cls_limit = things_only_ ? std::min(NUM_FG_CLASSES, 80) : NUM_FG_CLASSES;
+            for (int c = 0; c < std::min(cls_limit, C - 1); ++c)
+                cands.push_back({k, c, probs[c]});
         }
 
-        // Sort by score descending
+        const size_t top_n = std::min<size_t>(TOPK_DETECTIONS, cands.size());
+        std::partial_sort(cands.begin(), cands.begin() + top_n, cands.end(),
+                          [](const Cand& a, const Cand& b) { return a.cls_score > b.cls_score; });
+
+        for (size_t i = 0; i < top_n; ++i) {
+            const auto& cand = cands[i];
+            if (cand.cls_score < score_thresh_) continue;
+
+            const float* mask_ptr = masks.data() + cand.kernel * mask_h * mask_w;
+            cv::Mat low_mask(mask_h, mask_w, CV_32FC1);
+            cv::Mat binary_low(mask_h, mask_w, CV_8UC1);
+            float mask_sum = 0.f;
+            int mask_count = 0;
+            for (int y = 0; y < mask_h; ++y) {
+                for (int x = 0; x < mask_w; ++x) {
+                    const float logit = mask_ptr[y * mask_w + x];
+                    const float prob = sigmoid(logit);
+                    low_mask.at<float>(y, x) = prob;
+                    const bool on = logit > 0.f;  // official YOSO uses logit > 0
+                    binary_low.at<uchar>(y, x) = on ? 255 : 0;
+                    if (on) {
+                        mask_sum += prob;
+                        ++mask_count;
+                    }
+                }
+            }
+            if (mask_count == 0) continue;
+
+            const float mask_score = mask_sum / float(mask_count);
+            const float final_score = cand.cls_score * mask_score;
+            if (final_score < score_thresh_) continue;
+
+            cv::Mat full_mask;
+            cv::resize(low_mask, full_mask, {orig_w, orig_h}, 0, 0, cv::INTER_LINEAR);
+            cv::Mat binary_mask;
+            cv::threshold(full_mask, binary_mask, mask_thresh_, 255, cv::THRESH_BINARY);
+            binary_mask.convertTo(binary_mask, CV_8UC1);
+
+            const float area_ratio =
+                float(cv::countNonZero(binary_mask)) / float(std::max(1, orig_h * orig_w));
+            if (area_ratio < min_area_ratio_ || area_ratio > max_area_ratio_) continue;
+
+            const auto& names = cocovis::class_names();
+            std::string name = (cand.cls < (int)names.size())
+                               ? names[cand.cls] : std::to_string(cand.cls);
+            results.push_back({cand.cls, final_score, name, binary_mask});
+        }
+
         std::sort(results.begin(), results.end(),
                   [](auto& a, auto& b){ return a.score > b.score; });
         return results;
@@ -582,11 +594,13 @@ private:
                 for (int c = 0; c < C; ++c) row[c] = logits[c * num_kernels_logits_ + k];
             }
 
-            float max_v = *std::max_element(row.begin(), row.end());
+            float max_v = row[0] / YOSO_TEMPERATURE;
+            for (int c = 1; c < C; ++c)
+                max_v = std::max(max_v, row[c] / YOSO_TEMPERATURE);
             float sum = 0.f;
             std::vector<float> probs(C);
             for (int c = 0; c < C; ++c) {
-                probs[c] = std::exp(row[c] - max_v);
+                probs[c] = std::exp(row[c] / YOSO_TEMPERATURE - max_v);
                 sum += probs[c];
             }
             for (auto& p : probs) p /= std::max(sum, 1e-8f);
@@ -606,7 +620,8 @@ private:
         std::cout << "[YOSO][DBG] top predictions:";
         for (size_t i = 0; i < top_n; ++i) {
             const auto& c = best[i];
-            std::string name = (c.cls < (int)CLASS_NAMES.size()) ? CLASS_NAMES[c.cls] : std::to_string(c.cls);
+            const auto& names = cocovis::class_names();
+            std::string name = (c.cls < (int)names.size()) ? names[c.cls] : std::to_string(c.cls);
             const float* mask_ptr = masks.data() + c.kernel * mask_h * mask_w;
             int active = 0;
             float mean = 0.f;
@@ -667,65 +682,6 @@ private:
     float min_area_ratio_;
     float max_area_ratio_;
 };
-
-// ─── visualisation ───────────────────────────────────────────────
-cv::Mat visualise(const cv::Mat& image,
-                  const std::vector<Detection>& dets,
-                  bool show_masks = true)
-{
-    static const std::vector<cv::Scalar> PALETTE = {
-        {255,56,56},{255,157,151},{255,112,31},{255,178,29},{207,210,49},
-        {72,249,10},{146,204,23},{61,219,134},{26,147,52},{0,212,187},
-        {44,153,168},{0,194,255},{52,69,147},{100,115,255},{0,24,236},
-        {132,56,255},{82,0,133},{203,56,255},{255,149,200},{255,55,199}
-    };
-
-    cv::Mat vis = image.clone();
-
-    for (size_t i = 0; i < dets.size(); ++i) {
-        const auto& d = dets[i];
-        cv::Scalar  c = PALETTE[i % PALETTE.size()];
-
-        // Coloured mask overlay
-        if (show_masks && !d.mask.empty()) {
-            cv::Mat colour(vis.size(), CV_32FC3, c);
-            cv::Mat mask3;
-            cv::cvtColor(d.mask, mask3, cv::COLOR_GRAY2BGR);
-            cv::Mat norm_mask;
-            mask3.convertTo(norm_mask, CV_32FC3, 1.f / 255.f);
-
-            cv::Mat vis_f;
-            vis.convertTo(vis_f, CV_32FC3);
-            cv::addWeighted(vis_f, 1.0, colour.mul(norm_mask), 0.4, 0.0, vis_f);
-            vis_f.convertTo(vis, CV_8UC3);
-        }
-
-        // Bounding box from mask contours
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(d.mask, contours, cv::RETR_EXTERNAL,
-                         cv::CHAIN_APPROX_SIMPLE);
-        if (!contours.empty()) {
-            cv::Rect bbox = cv::boundingRect(contours[0]);
-            for (auto& cnt : contours)
-                bbox |= cv::boundingRect(cnt);
-            cv::rectangle(vis, bbox, c, 2);
-
-            std::ostringstream label;
-            label << d.class_name << " " << std::fixed
-                  << std::setprecision(2) << d.score;
-            int baseline = 0;
-            auto ts = cv::getTextSize(label.str(), cv::FONT_HERSHEY_SIMPLEX,
-                                      0.5, 1, &baseline);
-            cv::rectangle(vis,
-                          {bbox.x, bbox.y - ts.height - 6},
-                          {bbox.x + ts.width + 4, bbox.y},
-                          c, -1);
-            cv::putText(vis, label.str(), {bbox.x + 2, bbox.y - 4},
-                        cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1);
-        }
-    }
-    return vis;
-}
 
 // ─── main ────────────────────────────────────────────────────────
 static void print_usage(const char* prog) {
@@ -810,16 +766,16 @@ int main(int argc, char** argv) {
         }
         std::cout << "[YOSO] Image: " << image.cols << "×" << image.rows << '\n';
 
-        auto dets = yoso.infer(image);
-        std::cout << "[YOSO] Detected " << dets.size() << " instances:\n";
-        for (size_t i = 0; i < dets.size(); ++i)
-            std::cout << "  [" << i << "] " << dets[i].class_name
-                      << "  score=" << dets[i].score << '\n';
+        auto result = yoso.infer(image);
+        std::cout << "[YOSO] Detected " << result.detections.size() << " instances:\n";
+        for (size_t i = 0; i < result.detections.size(); ++i)
+            std::cout << "  [" << i << "] " << result.detections[i].class_name
+                      << "  score=" << result.detections[i].score << '\n';
 
         std::filesystem::create_directories(out_dir);
         std::string stem  = std::filesystem::path(image_path).stem().string();
         std::string out_path = out_dir + "/" + stem + "_yoso.jpg";
-        cv::Mat vis = visualise(image, dets);
+        cv::Mat vis = cocovis::visualise(image, result.detections);
         cv::imwrite(out_path, vis);
         std::cout << "[YOSO] Result saved → " << out_path << '\n';
     } else {
@@ -846,15 +802,15 @@ int main(int argc, char** argv) {
             cap >> frame;
             if (frame.empty()) break;
 
-            auto dets = yoso.infer(frame);
-            last_vis = visualise(frame, dets);
+            auto result = yoso.infer(frame);
+            last_vis = cocovis::visualise(frame, result.detections);
             std::ostringstream hud;
-            hud << "det=" << dets.size()
-                << " score>=" << std::fixed << std::setprecision(2) << score_thresh
-                << " mask>=" << std::fixed << std::setprecision(2) << mask_thresh;
+            hud << "FPS: " << std::fixed << std::setprecision(1) << result.fps()
+                << "  det=" << result.detections.size()
+                << "  total=" << std::setprecision(0) << result.total_ms << "ms";
             cv::putText(last_vis, hud.str(),
                         {10, 30}, cv::FONT_HERSHEY_SIMPLEX, 0.8,
-                        {255, 255, 255}, 2);
+                        {0, 255, 0}, 2);
             cv::putText(last_vis, "Press q/ESC to quit",
                         {10, 60}, cv::FONT_HERSHEY_SIMPLEX, 0.8,
                         {255, 255, 255}, 2);

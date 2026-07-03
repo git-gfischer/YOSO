@@ -48,4 +48,5 @@ _darcs
 !/datasets/*.*
 /projects/*/datasets
 /models
+/vendor/yoso
 /snippet
