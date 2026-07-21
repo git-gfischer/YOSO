@@ -95,8 +95,8 @@ struct Detection {
 class YOSOInference {
 public:
     explicit YOSOInference(const std::string& engine_path,
-                           float score_thresh = 0.5f,
-                           float mask_thresh  = 0.5f,
+                           float score_thresh = 0.9f,
+                           float mask_thresh  = 0.7f,
                            bool things_only   = false,
                            float min_area_ratio = 0.0f,
                            float max_area_ratio = 0.98f,
@@ -707,7 +707,7 @@ static void print_usage(const char* prog) {
 
 int main(int argc, char** argv) {
     std::string engine_path, image_path, out_dir = "./results";
-    float score_thresh = 0.3f, mask_thresh = 0.5f;
+    float score_thresh = 0.8f, mask_thresh = 0.7f;
     float min_area_ratio = 0.0f, max_area_ratio = 0.98f;
     bool things_only = false;
     bool debug_preds = false;
