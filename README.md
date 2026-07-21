@@ -67,8 +67,8 @@ The Docker image handles the full pipeline automatically:
 
 ```bash
 docker compose -f docker/docker-compose.yaml build
-docker compose -f docker/docker-compose.yaml up -d
-docker exec -it yoso-cpp bash
+xhost +
+docker compose -f docker/docker-compose.yaml run yoso bash
 ```
 
 On first start the entrypoint builds `models/yoso_res50.engine` if it is missing.
